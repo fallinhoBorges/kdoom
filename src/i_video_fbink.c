@@ -35,7 +35,7 @@ int video_out_h = 0;
 // O Doom desenha com indices de cor (0-255) de uma paleta. Esta tabela converte cada
 // indice no brilho real (luminancia) da cor, com correcao de gamma, para a tela e-ink.
 static byte gray_lut[256];
-static float gamma_val = 0.75f; // < 1 clareia os tons medios (a tela e-ink tende a ficar escura)
+static float gamma_val = 0.65f; // < 1 clareia os tons medios (a tela e-ink tende a ficar escura)
 
 // Controle de envio de quadros: so manda para a tela e-ink quando o quadro mudou, e espera
 // o EPDC terminar a atualizacao anterior antes de mandar outra (ele atualiza no maximo
@@ -48,6 +48,8 @@ static bool dump_enabled = false;  // -dump: grava quadros em /mnt/us para diagn
 static int dump_next = 0;          // proximo instante de gravacao (indice em dump_times)
 static const int dump_times[] = {20, 45, 75, 110, 150}; // segundos desde o inicio
 static int start_tic = 0;
+static int flash_secs = 60;        // -flash N: limpeza em branco com piscada a cada N s (0 desliga)
+static int last_flash_tic = 0;
 static int *xmap = NULL; // coluna de origem para cada coluna de saida
 static int *ymap = NULL; // linha de origem para cada linha de saida
 
@@ -152,6 +154,18 @@ void I_GetScreenSize(int *width, int *height) {
 }
 
 // Initialize the video system
+// Limpa a tela inteira em branco COM piscada (GC16). Reinicia o estado fisico da tela e
+// remove "fantasmas" - o modo rapido (A2) so se comporta bem a partir de uma tela assim,
+// como o proprio FBInk faz antes de usar A2.
+static void FlashClear(void) {
+  FBInkConfig clr = fbink_cfg;
+  clr.wfm_mode = WFM_GC16;
+  clr.is_flashing = true;
+  clr.dithering_mode = HWD_PASSTHROUGH;
+  fbink_cls(fbink_fd, &clr, NULL, false);
+  fbink_wait_for_complete(fbink_fd, LAST_MARKER);
+}
+
 void I_InitGraphics(void) {
   usleep(500000); // sleep 0.5s
   printf("I_InitGraphics\n");
@@ -174,12 +188,12 @@ void I_InitGraphics(void) {
       norefresh = true;
   }
 
-  // -gamma <numero>: brilho dos tons medios (padrao 0.75; menor = mais claro)
+  // -gamma <numero>: brilho dos tons medios (padrao 0.65; menor = mais claro)
   int pg = M_CheckParmWithArgs("-gamma", 1);
   if (pg) {
       gamma_val = (float)atof(myargv[pg + 1]);
       if (gamma_val < 0.2f || gamma_val > 3.0f) {
-          gamma_val = 0.75f;
+          gamma_val = 0.65f;
       }
   }
 
@@ -205,6 +219,19 @@ void I_InitGraphics(void) {
 
   if (M_CheckParm("-dump")) {
       dump_enabled = true;
+  }
+
+  // Neste Kindle tudo que o FBInk desenha aparece com claro e escuro trocados (visto nos
+  // quadros gravados com -dump e em fotos da tela). Inverte por padrao; -noinv desliga.
+  fbink_cfg.is_inverted = !M_CheckParm("-noinv");
+
+  // -flash <segundos>: intervalo da limpeza em branco com piscada (0 = so no inicio)
+  int pf = M_CheckParmWithArgs("-flash", 1);
+  if (pf) {
+      flash_secs = atoi(myargv[pf + 1]);
+      if (flash_secs < 0) {
+          flash_secs = 0;
+      }
   }
 
   // Initialize FBInk
@@ -250,11 +277,9 @@ void I_InitGraphics(void) {
       .height = h,
   };
 
-  for (int i = 0; i < 3; i++) { // Prevent menu ghosting
-    // Clear the screen
-    ret = fbink_cls(fbink_fd, &fbink_cfg, NULL, NULL);
-    printf("fbink_cls: %d\n", ret);
-  }
+  // Limpeza inicial: branco com piscada (reinicia a tela para o modo rapido)
+  FlashClear();
+  last_flash_tic = I_GetTime();
 
   // Allocate video buffer
   I_VideoBuffer = (byte *)Z_Malloc(SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);
@@ -322,13 +347,17 @@ void I_FinishUpdate(void) {
     dump_next++;
   }
 
-  if (frame == 0 && !norefresh) {
-    // Clear the screen
-    ret = fbink_cls(fbink_fd, &fbink_cfg, &screen_scaled, false);
-    (void)ret;
-    // Redraw buttons
+  // Limpeza periodica com piscada (-flash N s): elimina o "fantasma" acumulado
+  if (!norefresh && flash_secs > 0 &&
+      (I_GetTime() - last_flash_tic) >= flash_secs * TICRATE) {
+    FlashClear();
+    last_flash_tic = I_GetTime();
     PlaceKeys();
     force = true; // a tela foi limpa: o jogo precisa ser redesenhado
+  }
+
+  if (!norefresh && frame == 0) {
+    PlaceKeys();
   }
 
   // A interface do Kindle pode redesenhar a tela logo depois que o jogo abre:

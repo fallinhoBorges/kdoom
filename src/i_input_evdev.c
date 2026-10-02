@@ -67,6 +67,7 @@ int scw = 0;
 int sch = 0;
 
 void I_GetScreenSize(int *width, int *height);
+extern int video_out_h; // altura da area do jogo (i_video_fbink.c)
 
 Button upKey = {
     .key = KEY_UPARROW,
@@ -179,20 +180,36 @@ Button *keys[] = {&upKey, &downKey, &leftKey, &rightKey, &fireKey, &useKey, &esc
 __attribute__ ((weak)) int fbink_fd;
 __attribute__ ((weak)) FBInkConfig fbink_cfg;
 
+// Posiciona um botao numa grade de celulas quadradas de lado u
+static void SetRect(Button *b, int col, int row, int wc, int hc, int u, int pad, int y0) {
+    b->rect.left   = col * u + pad;
+    b->rect.top    = y0 + row * u + pad;
+    b->rect.width  = wc * u - 2 * pad;
+    b->rect.height = hc * u - 2 * pad;
+}
+
+// Gamepad na metade de baixo da tela, logo abaixo da imagem do jogo:
+//   esquerda: setas em cruz;  direita: ESC ENTER Y em cima, USE e FIRE (grande) embaixo
 void CalcKeyPos(void) {
-    printf("CalcKeyPos\n");
-    for (int i = 0; i < NKEYS; i++) {
-        if (!keys[i]) {
-            break; // It's joever
-        }
-
-        keys[i]->rect.width = BTN_SIZE;
-        keys[i]->rect.height = BTN_SIZE;
-
-        keys[i]->rect.left = (BTN_SIZE * i) + (BTN_PAD * i);
-        keys[i]->rect.top = (sch - BTN_SIZE) + BTN_PAD;
-        printf("%d %d %d %d\n", keys[i]->rect.left, keys[i]->rect.top, keys[i]->rect.width, keys[i]->rect.height);
+    int u = scw / 7;
+    int y0 = video_out_h + u / 6;
+    if (y0 + 3 * u > sch) {
+        u = (sch - y0) / 3;   // telas mais baixas: reduz as celulas
     }
+    int pad = u / 12;
+    BTN_SIZE = u;
+    BTN_PAD = pad;
+
+    SetRect(&upKey,    1, 0, 1, 1, u, pad, y0);
+    SetRect(&leftKey,  0, 1, 1, 1, u, pad, y0);
+    SetRect(&rightKey, 2, 1, 1, 1, u, pad, y0);
+    SetRect(&downKey,  1, 2, 1, 1, u, pad, y0);
+
+    SetRect(&escKey,   4, 0, 1, 1, u, pad, y0);
+    SetRect(&enterKey, 5, 0, 1, 1, u, pad, y0);
+    SetRect(&yesKey,   6, 0, 1, 1, u, pad, y0);
+    SetRect(&useKey,   4, 1, 1, 1, u, pad, y0);
+    SetRect(&fireKey,  5, 1, 2, 2, u, pad, y0);
 }
 
 void PlaceKeys(void) {
@@ -217,7 +234,8 @@ void PlaceKeys(void) {
             break; // It's joever
         }
         printf("Placing key %d\n", i);
-        fbink_ot_cfg.margins.top = keys[i]->rect.top + (BTN_SIZE / 2) - (fbink_ot_cfg.size_px / 2);
+        fbink_ot_cfg.size_px = MIN(MIN(keys[i]->rect.width, keys[i]->rect.height) / 4, 56);
+        fbink_ot_cfg.margins.top = keys[i]->rect.top + (keys[i]->rect.height / 2) - (fbink_ot_cfg.size_px / 2);
         fbink_ot_cfg.margins.left = keys[i]->rect.left;
         fbink_ot_cfg.margins.right = scw - (keys[i]->rect.left + keys[i]->rect.width);
         printf("%d %d %d\n", fbink_ot_cfg.margins.top, fbink_ot_cfg.margins.left, fbink_ot_cfg.margins.right);
@@ -294,9 +312,52 @@ void I_InitInput(void) {
 	pfd.events        = POLLIN;
 }
 
-void I_GetEvent(void) {
+// ---- Multitoque: cada dedo (slot) e rastreado; ao fim de cada pacote de eventos
+// (SYN_REPORT) o estado de todos os botoes e recalculado e so as mudancas viram
+// eventos de tecla. Assim da para andar e atirar ao mesmo tempo, e uma tecla nunca
+// fica "presa" quando o dedo sai do botao.
+#define MAX_SLOTS 5
+
+static struct {
+    int x;
+    int y;
+    bool down;
+} slots[MAX_SLOTS];
+
+static int cur_slot = 0;
+static bool btn_state[16];
+
+static void UpdateButtons(void) {
     event_t event;
 
+    for (int i = 0; i < NKEYS; i++) {
+        if (!keys[i]) {
+            break;
+        }
+
+        bool pressed = false;
+        for (int s = 0; s < MAX_SLOTS; s++) {
+            if (!slots[s].down) {
+                continue;
+            }
+            if (slots[s].x >= keys[i]->rect.left && slots[s].x <= keys[i]->rect.left + keys[i]->rect.width &&
+                slots[s].y >= keys[i]->rect.top && slots[s].y <= keys[i]->rect.top + keys[i]->rect.height) {
+                pressed = true;
+                break;
+            }
+        }
+
+        if (pressed != btn_state[i]) {
+            btn_state[i] = pressed;
+            memset(&event, 0, sizeof(event));
+            event.type = pressed ? ev_keydown : ev_keyup;
+            event.data1 = keys[i]->key;
+            D_PostEvent(&event);
+        }
+    }
+}
+
+void I_GetEvent(void) {
     if (init_failed) {
         return;
     }
@@ -304,57 +365,54 @@ void I_GetEvent(void) {
     int poll_num = poll(&pfd, 1, 0); // Doesn't matter if we time out, we can let the game run without inputs
 
     if (poll_num == -1) {
-        if (errno == EINTR) {
-            return;
+        if (errno != EINTR) {
+            perror("poll");
         }
-        fprintf(stderr, "poll: %m\n");
-    } else if (poll_num > 0) {
-        if (pfd.revents & POLLIN) {
-            struct input_event ev;
-            while (libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev) == 0) {
-                printf("Event: type %d code %d value %d\n", ev.type, ev.code, ev.value);
-                if (ev.type == EV_ABS) {
-                    switch (ev.code) {
-                        case ABS_MT_POSITION_X:
-                            touch_ev.pos.x = ev.value;
-                            break;
-                        case ABS_MT_POSITION_Y:
-                            touch_ev.pos.y = ev.value;
-                            break;
-                        case ABS_MT_PRESSURE:
-                            if (ev.value > 0) {
-                                touch_ev.down = true;
-                            } else {
-                                touch_ev.down = false;
-                            }
-                            break;
-                    }
-                    printf("Touch %s: (%d, %d) \n", touch_ev.down ? "DOWN" : "UP", touch_ev.pos.x, touch_ev.pos.y);
-
-                    for (int i = 0; i < NKEYS; i++) {
-                        if (!keys[i]) {
-                            break; // It's joever
-                        }
-
-                        Coord touch = touch_ev.pos;
-
-                        if (touch.x >= keys[i]->rect.left && touch.x <= keys[i]->rect.left + keys[i]->rect.width &&
-                            touch.y >= keys[i]->rect.top && touch.y <= keys[i]->rect.top + keys[i]->rect.height) {
-                            printf("Key %d %s\n", keys[i]->key, touch_ev.down ? "DOWN" : "UP");
-                            event.type = touch_ev.down ? ev_keydown : ev_keyup;
-                            event.data1 = keys[i]->key;
-
-                            D_PostEvent(&event);
-                        }
-                    }
-
-                    prev_ev = touch_ev;
-
-                }
-            }
-        }
-    } else {
         return;
+    }
+    if (poll_num == 0 || !(pfd.revents & POLLIN)) {
+        return;
+    }
+
+    struct input_event ev;
+    for (;;) {
+        int rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+
+        if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+            // eventos foram perdidos (SYN_DROPPED): descarta o resync e solta tudo
+            while (libevdev_next_event(dev, LIBEVDEV_READ_FLAG_SYNC, &ev) == LIBEVDEV_READ_STATUS_SYNC) {
+            }
+            memset(slots, 0, sizeof(slots));
+            UpdateButtons();
+            continue;
+        }
+        if (rc != LIBEVDEV_READ_STATUS_SUCCESS) {
+            break; // sem mais eventos (-EAGAIN) ou erro
+        }
+
+        if (ev.type == EV_ABS) {
+            switch (ev.code) {
+                case ABS_MT_SLOT:
+                    cur_slot = (ev.value >= 0 && ev.value < MAX_SLOTS) ? ev.value : 0;
+                    break;
+                case ABS_MT_POSITION_X:
+                    slots[cur_slot].x = ev.value;
+                    break;
+                case ABS_MT_POSITION_Y:
+                    slots[cur_slot].y = ev.value;
+                    break;
+                case ABS_MT_TRACKING_ID:
+                    if (ev.value == -1) {
+                        slots[cur_slot].down = false; // dedo levantado
+                    }
+                    break;
+                case ABS_MT_PRESSURE:
+                    slots[cur_slot].down = ev.value > 0;
+                    break;
+            }
+        } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+            UpdateButtons();
+        }
     }
 }
 

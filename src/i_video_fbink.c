@@ -24,6 +24,14 @@
 
 int scale_factor = 2; // TODO: Scale based on res?
 
+// Area do jogo na tela: largura total, com aspecto 4:3 (o Doom usa pixels nao
+// quadrados: 320x200 deve ser mostrado como 4:3). video_out_h e usado pelo
+// codigo de toque para posicionar o gamepad logo abaixo da imagem.
+int video_out_w = 0;
+int video_out_h = 0;
+static int *xmap = NULL; // coluna de origem para cada coluna de saida
+static int *ymap = NULL; // linha de origem para cada linha de saida
+
 int frame = 0;
 
 // Configuration for FBInk
@@ -164,6 +172,25 @@ void I_InitGraphics(void) {
   // Calculate scale factor
   scale_factor = w / SCREENWIDTH;
 
+  // Ampliacao para a largura inteira, mantendo 4:3
+  video_out_w = (int)w;
+  video_out_h = (int)(((long)w * 3) / 4);
+  if (video_out_h > (int)h) {
+    video_out_h = (int)h;
+  }
+  xmap = (int *)malloc(sizeof(int) * video_out_w);
+  ymap = (int *)malloc(sizeof(int) * video_out_h);
+  if (xmap == NULL || ymap == NULL) {
+    fprintf(stderr, "sem memoria para as tabelas de escala");
+    exit(1);
+  }
+  for (int xx = 0; xx < video_out_w; xx++) {
+    xmap[xx] = (xx * SCREENWIDTH) / video_out_w;
+  }
+  for (int yy = 0; yy < video_out_h; yy++) {
+    ymap[yy] = (yy * SCREENHEIGHT) / video_out_h;
+  }
+
   screen_scaled = (FBInkRect){
       .left = 0,
       .top = 0,
@@ -179,9 +206,11 @@ void I_InitGraphics(void) {
 
   // Allocate video buffer
   I_VideoBuffer = (byte *)Z_Malloc(SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);
-  I_VideoBuffer_FB = (byte *)Z_Malloc((SCREENWIDTH * scale_factor) *
-                                          (SCREENHEIGHT * scale_factor),
-                                      PU_STATIC, NULL);
+  I_VideoBuffer_FB = (byte *)malloc((size_t)video_out_w * video_out_h);
+  if (I_VideoBuffer_FB == NULL) {
+    fprintf(stderr, "sem memoria para o buffer de video");
+    exit(1);
+  }
 
   // Finish up
   screenvisible = true;
@@ -223,25 +252,24 @@ void I_FinishUpdate(void) {
   // ret = fbink_cls(fbink_fd, &fbink_cfg, &screenLarger, false);
   // printf("fbink_cls: %d\n", ret);
 
-  // Scale video buffer by scale_factor
-  for (int i = 0; i < SCREENHEIGHT; i++) { // Iterate over pixels
-    for (int j = 0; j < SCREENWIDTH; j++) {
-      for (int k = 0; k < scale_factor; k++) {   // duplicate lines
-        for (int l = 0; l < scale_factor; l++) { // duplicate pixels
-          I_VideoBuffer_FB[(i * scale_factor + k) * SCREENWIDTH * scale_factor +
-                           (j * scale_factor + l)] =
-              I_VideoBuffer[i * SCREENWIDTH + j];
-        }
-      }
+  // Amplia o quadro (320x200) para a largura da tela (vizinho mais proximo)
+  for (int y = 0; y < video_out_h; y++) {
+    byte *dst = I_VideoBuffer_FB + (size_t)y * video_out_w;
+    if (y > 0 && ymap[y] == ymap[y - 1]) {
+      memcpy(dst, dst - video_out_w, video_out_w); // mesma linha de origem
+      continue;
+    }
+    const byte *src = I_VideoBuffer + ymap[y] * SCREENWIDTH;
+    for (int x = 0; x < video_out_w; x++) {
+      dst[x] = src[xmap[x]];
     }
   }
 
   // Finally, print the buffer to the screen
-  ret = fbink_print_raw_data(
-      fbink_fd, (unsigned char *)I_VideoBuffer_FB, SCREENWIDTH * scale_factor,
-      SCREENHEIGHT * scale_factor,
-      (SCREENWIDTH * scale_factor) * (SCREENHEIGHT * scale_factor), 0, 0,
-      &fbink_cfg);
+  ret = fbink_print_raw_data(fbink_fd, (unsigned char *)I_VideoBuffer_FB,
+                             video_out_w, video_out_h,
+                             (size_t)video_out_w * video_out_h, 0, 0,
+                             &fbink_cfg);
 
 #ifdef DEBUG
   printf("fbink_print_raw_data: %d\n", ret);

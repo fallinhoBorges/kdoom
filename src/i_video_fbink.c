@@ -36,6 +36,18 @@ int video_out_h = 0;
 // indice no brilho real (luminancia) da cor, com correcao de gamma, para a tela e-ink.
 static byte gray_lut[256];
 static float gamma_val = 0.75f; // < 1 clareia os tons medios (a tela e-ink tende a ficar escura)
+
+// Controle de envio de quadros: so manda para a tela e-ink quando o quadro mudou, e espera
+// o EPDC terminar a atualizacao anterior antes de mandar outra (ele atualiza no maximo
+// ~4-8 vezes por segundo; mandar 35 quadros/s so enfileira trabalho e vira "chuvisco").
+static byte *prev_idx = NULL;      // copia dos indices do ultimo quadro enviado
+static int lut_gen = 0;            // muda a cada nova paleta
+static int last_lut_gen = -1;
+static byte last_palette[768];     // ultima paleta recebida (para diagnostico)
+static bool dump_enabled = false;  // -dump: grava quadros em /mnt/us para diagnostico
+static int dump_next = 0;          // proximo instante de gravacao (indice em dump_times)
+static const int dump_times[] = {20, 45, 75, 110, 150}; // segundos desde o inicio
+static int start_tic = 0;
 static int *xmap = NULL; // coluna de origem para cada coluna de saida
 static int *ymap = NULL; // linha de origem para cada linha de saida
 
@@ -191,6 +203,10 @@ void I_InitGraphics(void) {
       gray_lut[i] = (byte)i; // identidade ate o Doom enviar a paleta real
   }
 
+  if (M_CheckParm("-dump")) {
+      dump_enabled = true;
+  }
+
   // Initialize FBInk
   int ret = fbink_init(fbink_fd, &fbink_cfg);
   if (ret < 0 || ret == ENOSYS) {
@@ -243,10 +259,13 @@ void I_InitGraphics(void) {
   // Allocate video buffer
   I_VideoBuffer = (byte *)Z_Malloc(SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);
   I_VideoBuffer_FB = (byte *)malloc((size_t)video_out_w * video_out_h);
-  if (I_VideoBuffer_FB == NULL) {
+  prev_idx = (byte *)malloc(SCREENWIDTH * SCREENHEIGHT);
+  if (I_VideoBuffer_FB == NULL || prev_idx == NULL) {
     fprintf(stderr, "sem memoria para o buffer de video");
     exit(1);
   }
+  memset(prev_idx, 0, SCREENWIDTH * SCREENHEIGHT);
+  start_tic = I_GetTime();
 
   // Finish up
   screenvisible = true;
@@ -264,22 +283,52 @@ void I_ShutdownGraphics(void) {
   fbink_close(fbink_fd);
 }
 
+// Grava um quadro em formato PGM (cabecalho simples, sem quebras de linha)
+static void DumpPgm(const char *path, const byte *data, int w, int h) {
+  FILE *f = fopen(path, "wb");
+  if (f == NULL) {
+    return;
+  }
+  fprintf(f, "P5 %d %d 255 ", w, h);
+  fwrite(data, 1, (size_t)w * h, f);
+  fclose(f);
+}
+
+// Diagnostico (-dump): grava o que o jogo desenhou (indices), o que foi enviado a tela
+// (apos paleta/gamma/escala) e a paleta usada.
+static void DumpFrame(int n) {
+  char path[96];
+  snprintf(path, sizeof(path), "/mnt/us/dump_%d_idx.pgm", n);
+  DumpPgm(path, I_VideoBuffer, SCREENWIDTH, SCREENHEIGHT);
+  snprintf(path, sizeof(path), "/mnt/us/dump_%d_out.pgm", n);
+  DumpPgm(path, I_VideoBuffer_FB, video_out_w, video_out_h);
+  snprintf(path, sizeof(path), "/mnt/us/dump_%d_pal.bin", n);
+  FILE *f = fopen(path, "wb");
+  if (f != NULL) {
+    fwrite(last_palette, 1, sizeof(last_palette), f);
+    fclose(f);
+  }
+}
+
 // Update the screen.
 // this is where the magic happens (bazinga)
 void I_FinishUpdate(void) {
-#ifdef DEBUG
-  printf("I_FinishUpdate\n");
-#endif
   int ret;
+  bool force = false;
+
+  if (dump_enabled && dump_next < (int)(sizeof(dump_times) / sizeof(dump_times[0])) &&
+      (I_GetTime() - start_tic) / TICRATE >= dump_times[dump_next]) {
+    DumpFrame(dump_times[dump_next]);
+    dump_next++;
+  }
 
   if (frame == 0 && !norefresh) {
     // Clear the screen
     ret = fbink_cls(fbink_fd, &fbink_cfg, &screen_scaled, false);
-    #if DEBUG
-    printf("fbink_cls: %d\n", ret);
-    #endif
+    (void)ret;
     // Redraw buttons
     PlaceKeys();
+    force = true; // a tela foi limpa: o jogo precisa ser redesenhado
   }
 
   // A interface do Kindle pode redesenhar a tela logo depois que o jogo abre:
@@ -288,11 +337,13 @@ void I_FinishUpdate(void) {
     PlaceKeys();
   }
 
-  // clearing the screen on each frame would technically look better,
-  // but since the refresh rate on the e-ink is so bad,
-  // we can't afford to do that without it looking like hot trash
-  // ret = fbink_cls(fbink_fd, &fbink_cfg, &screenLarger, false);
-  // printf("fbink_cls: %d\n", ret);
+  // Nada mudou desde o ultimo quadro enviado: nao gasta uma atualizacao da tela e-ink
+  if (!force && lut_gen == last_lut_gen &&
+      memcmp(I_VideoBuffer, prev_idx, SCREENWIDTH * SCREENHEIGHT) == 0) {
+    return;
+  }
+  memcpy(prev_idx, I_VideoBuffer, SCREENWIDTH * SCREENHEIGHT);
+  last_lut_gen = lut_gen;
 
   // Amplia o quadro (320x200) para a largura da tela (vizinho mais proximo)
   for (int y = 0; y < video_out_h; y++) {
@@ -307,17 +358,16 @@ void I_FinishUpdate(void) {
     }
   }
 
+  // Espera a tela terminar a atualizacao anterior (como um "vsync") antes de mandar outra
+  fbink_wait_for_complete(fbink_fd, LAST_MARKER);
+
   // Finally, print the buffer to the screen
   ret = fbink_print_raw_data(fbink_fd, (unsigned char *)I_VideoBuffer_FB,
                              video_out_w, video_out_h,
                              (size_t)video_out_w * video_out_h, 0, 0,
                              &fbink_cfg);
 
-#ifdef DEBUG
-  printf("fbink_print_raw_data: %d\n", ret);
-#endif
-
-  // usleep(290000);
+  (void)ret;
 }
 
 void I_StartFrame(void) {
@@ -353,6 +403,8 @@ void I_UpdateNoBlit(void) {
 }
 void I_SetPalette(byte *palette) {
   // palette: 256 entradas RGB (3 bytes cada). Converte para luminancia + gamma.
+  memcpy(last_palette, palette, sizeof(last_palette));
+  lut_gen++;
   for (int i = 0; i < 256; i++) {
     float r = palette[i * 3 + 0];
     float g = palette[i * 3 + 1];

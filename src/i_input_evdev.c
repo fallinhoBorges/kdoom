@@ -23,6 +23,7 @@
 #include "config.h"
 #include "doomkeys.h"
 #include "i_system.h"
+#include "i_timer.h"
 #include "i_video.h"
 
 int vanilla_keyboard_mapping = 1;
@@ -212,55 +213,112 @@ void CalcKeyPos(void) {
     SetRect(&fireKey,  5, 1, 2, 2, u, pad, y0);
 }
 
-// Desenha (ou redesenha) toda a area do gamepad: fundo branco que cobre qualquer coisa
-// que a interface do Kindle tenha deixado ali, e cada botao como uma caixa com borda
-// preta, com o rotulo centralizado.
+// Fonte de bitmap 5x7 so com as letras usadas nos rotulos (evita depender de fontes TTF
+// e de funcoes de desenho do FBInk: o gamepad e montado na memoria e enviado como imagem,
+// pelo mesmo caminho do jogo, entao as cores saem do jeito certo).
+static const struct {
+    char c;
+    unsigned char rows[7];
+} font5x7[] = {
+    {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+    {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}},
+    {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+    {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+    {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
+    {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'I', {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+    {'N', {0x11, 0x19, 0x15, 0x15, 0x13, 0x11, 0x11}},
+    {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+    {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+    {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A}},
+    {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+};
+
+static unsigned char *pad_buf = NULL;
+
+static void FillRect(unsigned char *buf, int bw, int bh, int x, int y, int w, int h, unsigned char v) {
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= bh) {
+            continue;
+        }
+        for (int xx = x; xx < x + w; xx++) {
+            if (xx >= 0 && xx < bw) {
+                buf[yy * bw + xx] = v;
+            }
+        }
+    }
+}
+
+static void DrawLabel(unsigned char *buf, int bw, int bh, int cx, int cy, const char *text, int scale) {
+    int n = (int)strlen(text);
+    int total_w = n * 5 * scale + (n - 1) * scale;
+    int x = cx - total_w / 2;
+    int y = cy - (7 * scale) / 2;
+
+    for (int i = 0; i < n; i++) {
+        const unsigned char *rows = NULL;
+        for (size_t g = 0; g < sizeof(font5x7) / sizeof(font5x7[0]); g++) {
+            if (font5x7[g].c == text[i]) {
+                rows = font5x7[g].rows;
+                break;
+            }
+        }
+        if (rows != NULL) {
+            for (int r = 0; r < 7; r++) {
+                for (int c = 0; c < 5; c++) {
+                    if (rows[r] & (0x10 >> c)) {
+                        FillRect(buf, bw, bh, x + c * scale, y + r * scale, scale, scale, 0);
+                    }
+                }
+            }
+        }
+        x += 6 * scale;
+    }
+}
+
+// Desenha (ou redesenha) toda a area do gamepad: fundo branco (cobre qualquer coisa que a
+// interface do Kindle tenha deixado ali) e cada botao como uma caixa de borda preta com
+// o rotulo centralizado. Enviado de uma vez, como imagem, logo abaixo do jogo.
 void PlaceKeys(void) {
-    FBInkRect pad_area = {
-        .left = 0,
-        .top = video_out_h,
-        .width = scw,
-        .height = sch - video_out_h,
-    };
-    fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &pad_area, false, 0xFF);
-
-    FBInkOTConfig fbink_ot_cfg = {
-        .size_px = BTN_SIZE / 4,
-        .is_centered = true,
-        .margins = {
-            .top = 0,
-            .bottom = 0,
-            .left = 0,
-            .right = 0,
+    int padh = sch - video_out_h;
+    if (padh <= 0) {
+        return;
+    }
+    if (pad_buf == NULL) {
+        pad_buf = (unsigned char *)malloc((size_t)scw * padh);
+        if (pad_buf == NULL) {
+            return;
         }
-    };
+    }
+    memset(pad_buf, 255, (size_t)scw * padh);
 
-    fbink_add_ot_font_v2("/usr/java/lib/fonts/Futura-Medium.ttf", FNT_REGULAR, &fbink_ot_cfg); // Should be on most if not all Kindles
-    size_t len = sizeof(keys) / sizeof(keys[0]);
-    for (int i = 0; i < len; i++) {
+    for (int i = 0; i < NKEYS; i++) {
         if (!keys[i]) {
-            break; // It's joever
+            break;
         }
+        int x0 = keys[i]->rect.left;
+        int y0 = keys[i]->rect.top - video_out_h;
+        int w = keys[i]->rect.width;
+        int h = keys[i]->rect.height;
 
-        // borda preta + miolo branco
-        FBInkRect outer = keys[i]->rect;
-        fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &outer, false, 0x00);
-        FBInkRect inner = {
-            .left = outer.left + 5,
-            .top = outer.top + 5,
-            .width = outer.width - 10,
-            .height = outer.height - 10,
-        };
-        fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &inner, false, 0xFF);
+        FillRect(pad_buf, scw, padh, x0, y0, w, h, 0);                  // borda preta
+        FillRect(pad_buf, scw, padh, x0 + 5, y0 + 5, w - 10, h - 10, 255); // miolo branco
 
-        fbink_ot_cfg.size_px = MIN(MIN(keys[i]->rect.width, keys[i]->rect.height) / 4, 56);
-        fbink_ot_cfg.margins.top = keys[i]->rect.top + (keys[i]->rect.height / 2) - (fbink_ot_cfg.size_px / 2);
-        fbink_ot_cfg.margins.left = keys[i]->rect.left;
-        fbink_ot_cfg.margins.right = scw - (keys[i]->rect.left + keys[i]->rect.width);
-        fbink_print_ot(fbink_fd, keys[i]->label, &fbink_ot_cfg, &fbink_cfg, 0U);
+        int n = (int)strlen(keys[i]->label);
+        int scale = MIN((w - 20) / (n * 6), (h - 20) / 9);
+        if (scale < 2) scale = 2;
+        if (scale > 8) scale = 8;
+        DrawLabel(pad_buf, scw, padh, x0 + w / 2, y0 + h / 2, keys[i]->label, scale);
     }
 
-    fbink_free_ot_fonts_v2(&fbink_ot_cfg); // TODO: Optimize this
+    fbink_wait_for_complete(fbink_fd, LAST_MARKER);
+    fbink_print_raw_data(fbink_fd, pad_buf, scw, padh, (size_t)scw * padh, 0, (short int)video_out_h, &fbink_cfg);
 }
 
 void I_InitInput(void) {
@@ -336,9 +394,33 @@ static struct {
 static int cur_slot = 0;
 static bool btn_state[16];
 
-static void UpdateButtons(void) {
-    event_t event;
+// Um toque rapido pode comecar e terminar entre duas leituras. No Doom, se a tecla subir
+// no mesmo "tic" em que desceu, o movimento/tiro nunca chega a acontecer. Por isso a
+// liberacao e adiada ate o proximo tic.
+static int down_tic[16];
+static bool pending_up[16];
 
+static void PostKey(int i, bool down) {
+    event_t event;
+    memset(&event, 0, sizeof(event));
+    event.type = down ? ev_keydown : ev_keyup;
+    event.data1 = keys[i]->key;
+    D_PostEvent(&event);
+}
+
+static void ProcessPendingReleases(void) {
+    for (int i = 0; i < NKEYS; i++) {
+        if (!keys[i]) {
+            break;
+        }
+        if (pending_up[i] && I_GetTime() > down_tic[i]) {
+            pending_up[i] = false;
+            PostKey(i, false);
+        }
+    }
+}
+
+static void UpdateButtons(void) {
     for (int i = 0; i < NKEYS; i++) {
         if (!keys[i]) {
             break;
@@ -356,12 +438,21 @@ static void UpdateButtons(void) {
             }
         }
 
-        if (pressed != btn_state[i]) {
-            btn_state[i] = pressed;
-            memset(&event, 0, sizeof(event));
-            event.type = pressed ? ev_keydown : ev_keyup;
-            event.data1 = keys[i]->key;
-            D_PostEvent(&event);
+        if (pressed && !btn_state[i]) {
+            btn_state[i] = true;
+            if (pending_up[i]) {
+                pending_up[i] = false; // ainda estava "segura" para o jogo: nao reenvia
+            } else {
+                down_tic[i] = I_GetTime();
+                PostKey(i, true);
+            }
+        } else if (!pressed && btn_state[i]) {
+            btn_state[i] = false;
+            if (I_GetTime() > down_tic[i]) {
+                PostKey(i, false);
+            } else {
+                pending_up[i] = true; // toque rapido: solta so no proximo tic
+            }
         }
     }
 }
@@ -370,6 +461,8 @@ void I_GetEvent(void) {
     if (init_failed) {
         return;
     }
+
+    ProcessPendingReleases();
 
     int poll_num = poll(&pfd, 1, 0); // Doesn't matter if we time out, we can let the game run without inputs
 

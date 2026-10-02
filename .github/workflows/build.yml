@@ -47,6 +47,7 @@ jobs:
         run: |
           mkdir -p output
           cp kdoom arch.txt output/
+          cp kdoom.map output/ || true
           sha256sum kdoom | tee output/kdoom.sha256
 
       - name: Publicar artefato

@@ -78,7 +78,10 @@ typedef bool boolean;
 // 	undef	= 0xFFFFFFFF
 // } boolean;
 
-typedef bool boolean;
+// IMPORTANTE: precisa ter o tamanho de um int (4 bytes), como no Doom original. O codigo
+// faz coisas como (int *) &plyr->weaponowned[i+1] (st_stuff.c): com 'bool' (1 byte) a
+// leitura juntava os bytes de varias armas e o jogo travava ao desenhar a barra de status.
+typedef int boolean;
 
 #endif
 

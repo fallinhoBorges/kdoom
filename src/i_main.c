@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 //
 // Copyright(C) 1993-1996 Id Software, Inc.
 // Copyright(C) 2005-2014 Simon Howard
@@ -23,7 +24,7 @@
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
-#include <execinfo.h>
+#include <ucontext.h>
 #include <sys/types.h>
 
 #include "doomtype.h"
@@ -48,21 +49,28 @@ void HandleSignal(int sig)
     I_Quit();
 }
 
-// Travamento (SIGSEGV etc.): grava no log onde aconteceu. O binario tem simbolos e
-// enderecos fixos, entao os enderecos abaixo podem ser traduzidos com o arquivo .map.
-void CrashHandler(int sig)
+// Travamento (SIGSEGV etc.): grava no log onde aconteceu. O backtrace() nao funciona em
+// codigo C sem tabelas de unwind no ARM, entao le direto os registradores do momento da
+// falha: pc = onde estava executando, lr = quem chamou, addr = endereco de memoria que
+// causou a falha. O binario tem enderecos fixos: traduza pc/lr com o arquivo kdoom.map.
+void CrashHandler(int sig, siginfo_t *info, void *ctx)
 {
-    void *frames[40];
-    char buf[64];
+    ucontext_t *uc = (ucontext_t *) ctx;
+    char buf[220];
     char nl = 10;
     int len;
-    int n;
 
-    len = snprintf(buf, sizeof(buf), "CRASH: sinal %d, backtrace:", sig);
+    len = snprintf(buf, sizeof(buf),
+                   "CRASH: sinal %d addr=%p pc=0x%08lx lr=0x%08lx sp=0x%08lx fp=0x%08lx r0=0x%08lx r1=0x%08lx",
+                   sig,
+                   info ? info->si_addr : NULL,
+                   (unsigned long) uc->uc_mcontext.arm_pc,
+                   (unsigned long) uc->uc_mcontext.arm_lr,
+                   (unsigned long) uc->uc_mcontext.arm_sp,
+                   (unsigned long) uc->uc_mcontext.arm_fp,
+                   (unsigned long) uc->uc_mcontext.arm_r0,
+                   (unsigned long) uc->uc_mcontext.arm_r1);
     write(2, buf, len);
-    write(2, &nl, 1);
-    n = backtrace(frames, 40);
-    backtrace_symbols_fd(frames, n, 2);
     write(2, &nl, 1);
     _exit(128 + sig);
 }
@@ -84,9 +92,17 @@ int main(int argc, char **argv)
     sigaction(SIGQUIT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
 
+    static char crash_stack[16384];
+    stack_t ss;
+    ss.ss_sp = crash_stack;
+    ss.ss_size = sizeof(crash_stack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+
     memset(&sa_crash, 0, sizeof(sa_crash));
     sigemptyset(&sa_crash.sa_mask);
-    sa_crash.sa_handler = CrashHandler;
+    sa_crash.sa_sigaction = CrashHandler;
+    sa_crash.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &sa_crash, NULL);
     sigaction(SIGILL, &sa_crash, NULL);
     sigaction(SIGBUS, &sa_crash, NULL);

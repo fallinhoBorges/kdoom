@@ -15,6 +15,9 @@ endif
 ifeq ($(ARMHF),1)
 	TC=arm-kindlehf-linux-gnueabihf
 	TARGET=kindlehf
+	# Kindles com firmware hard-float usam CPUs ARMv7-A (ex.: i.MX6 = Cortex-A9).
+	# Sem isso, algumas toolchains geram ARMv8 e o binario morre com SIGILL.
+	ARCHFLAGS=-march=armv7-a -mtune=cortex-a9 -mfpu=neon -mfloat-abi=hard
 else
 	TC=arm-kindlepw2-linux-gnueabi
 	TARGET=kindlepw2
@@ -25,6 +28,7 @@ OBJS+=$(OBJDIR)/i_input_evdev.o
 OBJS+=$(OBJDIR)/kill.o
 CC=$(TC)-gcc
 CFLAGS+=-ggdb3 -O2 -I./FBInk -fPIC -Wunused-const-variable=0 -Wall
+CFLAGS+=$(ARCHFLAGS)
 LDFLAGS+=-Wl,--gc-sections -L./FBInk/Release/static -L./FBInk/libevdev-staged/lib
 CFLAGS+=-ggdb3 -Wall -DNORMALUNIX -DLINUX
 LIBS+=-lm -lc -lfbink -l:libevdev.a

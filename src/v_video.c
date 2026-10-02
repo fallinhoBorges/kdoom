@@ -146,6 +146,11 @@ void V_DrawPatch(int x, int y, patch_t *patch)
     byte *source;
     int w;
 
+    if (patch == NULL)
+    {
+        return;
+    }
+
     y -= SHORT(patch->topoffset);
     x -= SHORT(patch->leftoffset);
 
@@ -210,6 +215,11 @@ void V_DrawPatchFlipped(int x, int y, patch_t *patch)
     byte *source; 
     int w; 
  
+    if (patch == NULL)
+    {
+        return;
+    }
+
     y -= SHORT(patch->topoffset); 
     x -= SHORT(patch->leftoffset); 
 
@@ -283,6 +293,11 @@ void V_DrawTLPatch(int x, int y, patch_t * patch)
     byte *desttop, *dest, *source;
     int w;
 
+    if (patch == NULL)
+    {
+        return;
+    }
+
     y -= SHORT(patch->topoffset);
     x -= SHORT(patch->leftoffset);
 
@@ -333,6 +348,11 @@ void V_DrawXlaPatch(int x, int y, patch_t * patch)
     byte *desttop, *dest, *source;
     int w;
 
+    if (patch == NULL)
+    {
+        return;
+    }
+
     y -= SHORT(patch->topoffset);
     x -= SHORT(patch->leftoffset);
 
@@ -381,6 +401,11 @@ void V_DrawAltTLPatch(int x, int y, patch_t * patch)
     column_t *column;
     byte *desttop, *dest, *source;
     int w;
+
+    if (patch == NULL)
+    {
+        return;
+    }
 
     y -= SHORT(patch->topoffset);
     x -= SHORT(patch->leftoffset);
@@ -432,6 +457,11 @@ void V_DrawShadowedPatch(int x, int y, patch_t *patch)
     byte *desttop, *dest, *source;
     byte *desttop2, *dest2;
     int w;
+
+    if (patch == NULL)
+    {
+        return;
+    }
 
     y -= SHORT(patch->topoffset);
     x -= SHORT(patch->leftoffset);

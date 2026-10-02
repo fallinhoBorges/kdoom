@@ -134,17 +134,54 @@ Button enterKey = {
     },
 };
 
+Button useKey = {
+    .key = KEY_USE,
+    .label = "USE",
+    .rect = {
+        .left = 0,
+        .top = 0,
+        .width = 0,
+        .height = 0,
+    },
+};
+
+Button escKey = {
+    .key = KEY_ESCAPE,
+    .label = "ESC",
+    .rect = {
+        .left = 0,
+        .top = 0,
+        .width = 0,
+        .height = 0,
+    },
+};
+
+Button yesKey = {
+    .key = 'y',
+    .label = "Y",
+    .rect = {
+        .left = 0,
+        .top = 0,
+        .width = 0,
+        .height = 0,
+    },
+};
+
 int BTN_SIZE = 100;
 int BTN_PAD = 10;
 
-Button *keys[] = {&upKey, &downKey, &leftKey, &rightKey, &fireKey, &enterKey, NULL};
+// Numero de "casas" na fileira de botoes (9 botoes + margem)
+#define BTN_SLOTS 9
+
+Button *keys[] = {&upKey, &downKey, &leftKey, &rightKey, &fireKey, &useKey, &escKey, &enterKey, &yesKey, NULL};
+#define NKEYS (sizeof(keys) / sizeof(keys[0]))
 
 __attribute__ ((weak)) int fbink_fd;
 __attribute__ ((weak)) FBInkConfig fbink_cfg;
 
 void CalcKeyPos(void) {
     printf("CalcKeyPos\n");
-    for (int i = 0; i < sizeof(keys); i++) {
+    for (int i = 0; i < NKEYS; i++) {
         if (!keys[i]) {
             break; // It's joever
         }
@@ -204,8 +241,8 @@ void I_InitInput(void) {
     // PlaceKeys();
     printf("I_InitInput\n");
     I_GetScreenSize(&scw, &sch);
-    BTN_PAD = (scw / 6) / 10;
-    BTN_SIZE = (scw / 6) - BTN_PAD;
+    BTN_PAD = (scw / BTN_SLOTS) / 10;
+    BTN_SIZE = (scw / BTN_SLOTS) - BTN_PAD;
 
     CalcKeyPos();
     PlaceKeys();
@@ -237,7 +274,7 @@ void I_InitInput(void) {
     dev    = libevdev_new();
 	int rc = libevdev_set_fd(dev, evfd);
 	if (rc < 0) {
-		sprintf(stderr, "Failed to initialize libevdev (%s)", strerror(-rc));
+		fprintf(stderr, "Failed to initialize libevdev (%s)\n", strerror(-rc));
         init_failed = true;
         return;
 	} else {
@@ -245,7 +282,7 @@ void I_InitInput(void) {
     }
 
     if (libevdev_grab(dev, LIBEVDEV_GRAB) != 0) {
-		sprintf(stderr, "Cannot read input events because the input device is currently grabbed by something else!");
+		fprintf(stderr, "Cannot read input events because the input device is currently grabbed by something else!\n");
         init_failed = true;
 		return;
 	} else {
@@ -271,7 +308,7 @@ void I_GetEvent(void) {
         if (errno == EINTR) {
             return;
         }
-        sprintf(stderr, "poll: %m");
+        fprintf(stderr, "poll: %m\n");
     } else if (poll_num > 0) {
         if (pfd.revents & POLLIN) {
             struct input_event ev;
@@ -295,7 +332,7 @@ void I_GetEvent(void) {
                     }
                     printf("Touch %s: (%d, %d) \n", touch_ev.down ? "DOWN" : "UP", touch_ev.pos.x, touch_ev.pos.y);
 
-                    for (int i = 0; i < sizeof(keys); i++) {
+                    for (int i = 0; i < NKEYS; i++) {
                         if (!keys[i]) {
                             break; // It's joever
                         }

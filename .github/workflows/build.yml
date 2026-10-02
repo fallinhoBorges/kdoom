@@ -1,0 +1,57 @@
+name: Build kdoom (Kindle hard-float, ARMv7-A)
+
+on:
+  push:
+    branches: [ "pw4-armv7-fixes" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (com submodulos, incluindo o FBInk)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Dependencias de build
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make autoconf automake libtool wget tar git python3 pkg-config
+
+      - name: Toolchain oficial do KOReader (kindlehf, release 2025.05)
+        run: |
+          wget -q https://github.com/koreader/koxtoolchain/releases/download/2025.05/kindlehf.tar.gz
+          sudo mkdir -p /opt/x-tools
+          sudo tar -xzf kindlehf.tar.gz -C /opt/x-tools
+          echo "/opt/x-tools/x-tools/arm-kindlehf-linux-gnueabihf/bin" >> "$GITHUB_PATH"
+
+      - name: Compilar
+        run: |
+          make ARMHF=1 \
+            CROSS_COMPILE=arm-kindlehf-linux-gnueabihf- \
+            CC="arm-kindlehf-linux-gnueabihf-gcc -Wno-implicit-function-declaration" \
+            AR=arm-kindlehf-linux-gnueabihf-ar \
+            STRIP=arm-kindlehf-linux-gnueabihf-strip \
+            RANLIB=arm-kindlehf-linux-gnueabihf-ranlib
+
+      - name: Verificar a arquitetura do binario (precisa ser ARMv7-A hard-float)
+        run: |
+          file kdoom
+          arm-kindlehf-linux-gnueabihf-readelf -A kdoom | tee arch.txt
+          grep -q "Tag_CPU_arch: v7" arch.txt
+          if grep -q "Tag_CPU_arch: v8" arch.txt; then echo "ERRO: binario v8"; exit 1; fi
+          grep -q "Tag_ABI_VFP_args: VFP registers" arch.txt
+
+      - name: Preparar artefatos
+        run: |
+          mkdir -p output
+          cp kdoom arch.txt output/
+          sha256sum kdoom | tee output/kdoom.sha256
+
+      - name: Publicar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: kdoom-kindlehf-armv7a
+          path: output/
+          retention-days: 30

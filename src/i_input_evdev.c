@@ -201,6 +201,7 @@ void PlaceKeys(void) {
 
     FBInkOTConfig fbink_ot_cfg = {
         .size_px = BTN_SIZE / 4,
+        .is_centered = true,
         .margins = {
             .top = 0,
             .bottom = 0,
@@ -217,10 +218,8 @@ void PlaceKeys(void) {
         }
         printf("Placing key %d\n", i);
         fbink_ot_cfg.margins.top = keys[i]->rect.top + (BTN_SIZE / 2) - (fbink_ot_cfg.size_px / 2);
-        short int l = MAX(keys[i]->rect.left - ((strlen(keys[i]->label) * fbink_ot_cfg.size_px)), 0);
-        printf("l: %d\n", l);
-        fbink_ot_cfg.margins.left = l + (BTN_SIZE);
-        fbink_ot_cfg.margins.right = MIN(scw - BTN_SIZE * i - BTN_PAD * i - (BTN_SIZE / 2), scw - BTN_SIZE);
+        fbink_ot_cfg.margins.left = keys[i]->rect.left;
+        fbink_ot_cfg.margins.right = scw - (keys[i]->rect.left + keys[i]->rect.width);
         printf("%d %d %d\n", fbink_ot_cfg.margins.top, fbink_ot_cfg.margins.left, fbink_ot_cfg.margins.right);
         // fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &keys[i]->rect, 0U, 0x00);
 #if DEBUG

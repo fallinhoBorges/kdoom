@@ -50,6 +50,17 @@ static const int dump_times[] = {20, 45, 75, 110, 150}; // segundos desde o inic
 static int start_tic = 0;
 static int flash_secs = 60;        // -flash N: limpeza em branco com piscada a cada N s (0 desliga)
 static int last_flash_tic = 0;
+
+// Envio por regioes + "assentamento": o modo rapido (A2) deixa residuo ("fantasma") a cada
+// troca de imagem. So a regiao que mudou e reenviada e, quando a tela fica parada por um
+// instante, essa regiao e refeita em 16 tons (GC16), que limpa o residuo.
+static byte *rect_buf = NULL;       // area de trabalho para uma regiao contigua
+static bool settle_pending = false; // ha residuo a limpar
+static int settle_x0, settle_y0, settle_x1, settle_y1; // regiao (coordenadas de saida) tocada
+static int last_major_tic = 0;      // ultima mudanca "grande" de imagem
+static int last_settle_tic = 0;
+static int settle_ms = 350;         // -settle N: pausa (ms) para limpar; 0 desliga
+static WFM_MODE_INDEX_T settle_wfm = WFM_GC16;
 static int *xmap = NULL; // coluna de origem para cada coluna de saida
 static int *ymap = NULL; // linha de origem para cada linha de saida
 
@@ -225,6 +236,23 @@ void I_InitGraphics(void) {
   // quadros gravados com -dump e em fotos da tela). Inverte por padrao; -noinv desliga.
   fbink_cfg.is_inverted = !M_CheckParm("-noinv");
 
+  // -settle <ms>: pausa sem mudancas grandes antes de limpar o residuo em 16 tons (0 desliga)
+  int ps = M_CheckParmWithArgs("-settle", 1);
+  if (ps) {
+      settle_ms = atoi(myargv[ps + 1]);
+      if (settle_ms < 0) {
+          settle_ms = 0;
+      }
+  }
+  // -settlewfm <gc16|gl16|reagl>: modo usado na limpeza
+  int pq = M_CheckParmWithArgs("-settlewfm", 1);
+  if (pq) {
+      const char *qn = myargv[pq + 1];
+      if (!strcmp(qn, "gl16")) settle_wfm = WFM_GL16;
+      else if (!strcmp(qn, "reagl")) settle_wfm = WFM_REAGL;
+      else settle_wfm = WFM_GC16;
+  }
+
   // -flash <segundos>: intervalo da limpeza em branco com piscada (0 = so no inicio)
   int pf = M_CheckParmWithArgs("-flash", 1);
   if (pf) {
@@ -285,7 +313,8 @@ void I_InitGraphics(void) {
   I_VideoBuffer = (byte *)Z_Malloc(SCREENWIDTH * SCREENHEIGHT, PU_STATIC, NULL);
   I_VideoBuffer_FB = (byte *)malloc((size_t)video_out_w * video_out_h);
   prev_idx = (byte *)malloc(SCREENWIDTH * SCREENHEIGHT);
-  if (I_VideoBuffer_FB == NULL || prev_idx == NULL) {
+  rect_buf = (byte *)malloc((size_t)video_out_w * video_out_h);
+  if (I_VideoBuffer_FB == NULL || prev_idx == NULL || rect_buf == NULL) {
     fprintf(stderr, "sem memoria para o buffer de video");
     exit(1);
   }
@@ -335,10 +364,49 @@ static void DumpFrame(int n) {
   }
 }
 
+// Envia uma regiao (coordenadas de saida) do buffer ja ampliado para a tela e-ink.
+static void SendRegion(const FBInkConfig *cfg, int x0, int y0, int x1, int y1) {
+  int rw = x1 - x0;
+  int rh = y1 - y0;
+
+  for (int y = 0; y < rh; y++) {
+    memcpy(rect_buf + (size_t)y * rw,
+           I_VideoBuffer_FB + (size_t)(y0 + y) * video_out_w + x0, rw);
+  }
+
+  // Espera a tela terminar a atualizacao anterior (como um "vsync") antes de mandar outra
+  fbink_wait_for_complete(fbink_fd, LAST_MARKER);
+  fbink_print_raw_data(fbink_fd, rect_buf, rw, rh, (size_t)rw * rh,
+                       (short int)x0, (short int)y0, cfg);
+}
+
+// Se a imagem parou de mudar (de forma significativa) por um instante, refaz em 16 tons a
+// regiao que foi mexendo: remove o "fantasma" do modo rapido e devolve a qualidade.
+static void SettleIfIdle(void) {
+  if (!settle_pending || settle_ms <= 0) {
+    return;
+  }
+  int now = I_GetTime();
+  if ((now - last_major_tic) * 1000 < settle_ms * TICRATE) {
+    return;
+  }
+  if ((now - last_settle_tic) * 1000 < 1500 * TICRATE) {
+    return; // no maximo uma limpeza a cada 1,5 s
+  }
+
+  FBInkConfig cfg = fbink_cfg;
+  cfg.wfm_mode = settle_wfm;
+  cfg.dithering_mode = HWD_PASSTHROUGH;
+  cfg.is_flashing = false;
+  SendRegion(&cfg, settle_x0, settle_y0, settle_x1, settle_y1);
+
+  settle_pending = false;
+  last_settle_tic = now;
+}
+
 // Update the screen.
 // this is where the magic happens (bazinga)
 void I_FinishUpdate(void) {
-  int ret;
   bool force = false;
 
   if (dump_enabled && dump_next < (int)(sizeof(dump_times) / sizeof(dump_times[0])) &&
@@ -354,6 +422,7 @@ void I_FinishUpdate(void) {
     last_flash_tic = I_GetTime();
     PlaceKeys();
     force = true; // a tela foi limpa: o jogo precisa ser redesenhado
+    settle_pending = false;
   }
 
   if (!norefresh && frame == 0) {
@@ -366,37 +435,85 @@ void I_FinishUpdate(void) {
     PlaceKeys();
   }
 
-  // Nada mudou desde o ultimo quadro enviado: nao gasta uma atualizacao da tela e-ink
-  if (!force && lut_gen == last_lut_gen &&
-      memcmp(I_VideoBuffer, prev_idx, SCREENWIDTH * SCREENHEIGHT) == 0) {
+  // Descobre a menor regiao que mudou desde o ultimo quadro enviado (coord. do jogo)
+  bool full = force || lut_gen != last_lut_gen;
+  int minx = SCREENWIDTH, maxx = -1, miny = SCREENHEIGHT, maxy = -1;
+  if (full) {
+    minx = 0;
+    maxx = SCREENWIDTH - 1;
+    miny = 0;
+    maxy = SCREENHEIGHT - 1;
+  } else {
+    for (int y = 0; y < SCREENHEIGHT; y++) {
+      const byte *ra = I_VideoBuffer + y * SCREENWIDTH;
+      const byte *rb = prev_idx + y * SCREENWIDTH;
+      if (memcmp(ra, rb, SCREENWIDTH) == 0) {
+        continue;
+      }
+      if (y < miny) miny = y;
+      if (y > maxy) maxy = y;
+      int xa = 0;
+      while (ra[xa] == rb[xa]) xa++;
+      int xb = SCREENWIDTH - 1;
+      while (ra[xb] == rb[xb]) xb--;
+      if (xa < minx) minx = xa;
+      if (xb > maxx) maxx = xb;
+    }
+  }
+
+  if (maxx < 0) {
+    SettleIfIdle(); // nada mudou: bom momento para limpar o residuo
     return;
   }
+
   memcpy(prev_idx, I_VideoBuffer, SCREENWIDTH * SCREENHEIGHT);
   last_lut_gen = lut_gen;
 
-  // Amplia o quadro (320x200) para a largura da tela (vizinho mais proximo)
-  for (int y = 0; y < video_out_h; y++) {
+  // Regiao em coordenadas de saida, alinhada a 16 px (o dithering por hardware usa um
+  // padrao periodico: alinhar evita costuras entre regioes atualizadas em momentos distintos)
+  int ox0 = (minx * video_out_w) / SCREENWIDTH;
+  int ox1 = ((maxx + 1) * video_out_w + SCREENWIDTH - 1) / SCREENWIDTH;
+  int oy0 = (miny * video_out_h) / SCREENHEIGHT;
+  int oy1 = ((maxy + 1) * video_out_h + SCREENHEIGHT - 1) / SCREENHEIGHT;
+  ox0 &= ~15;
+  oy0 &= ~15;
+  ox1 = (ox1 + 15) & ~15;
+  oy1 = (oy1 + 15) & ~15;
+  if (ox1 > video_out_w) ox1 = video_out_w;
+  if (oy1 > video_out_h) oy1 = video_out_h;
+
+  // Amplia so essa regiao (vizinho mais proximo) para o buffer de saida
+  for (int y = oy0; y < oy1; y++) {
     byte *dst = I_VideoBuffer_FB + (size_t)y * video_out_w;
-    if (y > 0 && ymap[y] == ymap[y - 1]) {
-      memcpy(dst, dst - video_out_w, video_out_w); // mesma linha de origem
+    if (y > oy0 && ymap[y] == ymap[y - 1]) {
+      memcpy(dst + ox0, dst - video_out_w + ox0, ox1 - ox0); // mesma linha de origem
       continue;
     }
     const byte *src = I_VideoBuffer + ymap[y] * SCREENWIDTH;
-    for (int x = 0; x < video_out_w; x++) {
+    for (int x = ox0; x < ox1; x++) {
       dst[x] = gray_lut[src[xmap[x]]];
     }
   }
 
-  // Espera a tela terminar a atualizacao anterior (como um "vsync") antes de mandar outra
-  fbink_wait_for_complete(fbink_fd, LAST_MARKER);
+  // Mudanca "grande"? So ela reinicia a contagem da pausa. A caveira do menu piscando e
+  // pequena e nao deve impedir a limpeza.
+  int now = I_GetTime();
+  if ((maxx - minx + 1) * (maxy - miny + 1) > 1500) {
+    last_major_tic = now;
+  }
 
-  // Finally, print the buffer to the screen
-  ret = fbink_print_raw_data(fbink_fd, (unsigned char *)I_VideoBuffer_FB,
-                             video_out_w, video_out_h,
-                             (size_t)video_out_w * video_out_h, 0, 0,
-                             &fbink_cfg);
+  // Acumula a regiao que precisara ser limpa
+  if (!settle_pending) {
+    settle_x0 = ox0; settle_y0 = oy0; settle_x1 = ox1; settle_y1 = oy1;
+    settle_pending = true;
+  } else {
+    if (ox0 < settle_x0) settle_x0 = ox0;
+    if (oy0 < settle_y0) settle_y0 = oy0;
+    if (ox1 > settle_x1) settle_x1 = ox1;
+    if (oy1 > settle_y1) settle_y1 = oy1;
+  }
 
-  (void)ret;
+  SendRegion(&fbink_cfg, ox0, oy0, ox1, oy1);
 }
 
 void I_StartFrame(void) {

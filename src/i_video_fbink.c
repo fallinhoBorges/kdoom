@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <memory.h>
+#include <math.h>
+#include <string.h>
 
 #include "i_timer.h"
 
@@ -29,6 +31,11 @@ int scale_factor = 2; // TODO: Scale based on res?
 // codigo de toque para posicionar o gamepad logo abaixo da imagem.
 int video_out_w = 0;
 int video_out_h = 0;
+
+// O Doom desenha com indices de cor (0-255) de uma paleta. Esta tabela converte cada
+// indice no brilho real (luminancia) da cor, com correcao de gamma, para a tela e-ink.
+static byte gray_lut[256];
+static float gamma_val = 0.75f; // < 1 clareia os tons medios (a tela e-ink tende a ficar escura)
 static int *xmap = NULL; // coluna de origem para cada coluna de saida
 static int *ymap = NULL; // linha de origem para cada linha de saida
 
@@ -155,6 +162,35 @@ void I_InitGraphics(void) {
       norefresh = true;
   }
 
+  // -gamma <numero>: brilho dos tons medios (padrao 0.75; menor = mais claro)
+  int pg = M_CheckParmWithArgs("-gamma", 1);
+  if (pg) {
+      gamma_val = (float)atof(myargv[pg + 1]);
+      if (gamma_val < 0.2f || gamma_val > 3.0f) {
+          gamma_val = 0.75f;
+      }
+  }
+
+  // -wfm <modo>: modo de atualizacao da tela e-ink
+  //   a2 (padrao, rapido, preto e branco), du (preto e branco), du4/gc4 (4 tons),
+  //   gl16/gc16/reagl (16 tons, mais lento)
+  int pw = M_CheckParmWithArgs("-wfm", 1);
+  if (pw) {
+      const char *wn = myargv[pw + 1];
+      if (!strcmp(wn, "a2")) fbink_cfg.wfm_mode = WFM_A2;
+      else if (!strcmp(wn, "du")) fbink_cfg.wfm_mode = WFM_DU;
+      else if (!strcmp(wn, "du4")) fbink_cfg.wfm_mode = WFM_DU4;
+      else if (!strcmp(wn, "gc4")) fbink_cfg.wfm_mode = WFM_GC4;
+      else if (!strcmp(wn, "gl16")) fbink_cfg.wfm_mode = WFM_GL16;
+      else if (!strcmp(wn, "gc16")) fbink_cfg.wfm_mode = WFM_GC16;
+      else if (!strcmp(wn, "reagl")) fbink_cfg.wfm_mode = WFM_REAGL;
+      else if (!strcmp(wn, "auto")) fbink_cfg.wfm_mode = WFM_AUTO;
+  }
+
+  for (int i = 0; i < 256; i++) {
+      gray_lut[i] = (byte)i; // identidade ate o Doom enviar a paleta real
+  }
+
   // Initialize FBInk
   int ret = fbink_init(fbink_fd, &fbink_cfg);
   if (ret < 0 || ret == ENOSYS) {
@@ -246,6 +282,12 @@ void I_FinishUpdate(void) {
     PlaceKeys();
   }
 
+  // A interface do Kindle pode redesenhar a tela logo depois que o jogo abre:
+  // repinta a area do gamepad algumas vezes no comeco.
+  if (!norefresh && (frame == 6 || frame == 50)) {
+    PlaceKeys();
+  }
+
   // clearing the screen on each frame would technically look better,
   // but since the refresh rate on the e-ink is so bad,
   // we can't afford to do that without it looking like hot trash
@@ -261,7 +303,7 @@ void I_FinishUpdate(void) {
     }
     const byte *src = I_VideoBuffer + ymap[y] * SCREENWIDTH;
     for (int x = 0; x < video_out_w; x++) {
-      dst[x] = src[xmap[x]];
+      dst[x] = gray_lut[src[xmap[x]]];
     }
   }
 
@@ -310,9 +352,15 @@ void I_UpdateNoBlit(void) {
 #endif
 }
 void I_SetPalette(byte *palette) {
-#ifdef DEBUG
-  printf("(N/I) I_SetPalette\n");
-#endif
+  // palette: 256 entradas RGB (3 bytes cada). Converte para luminancia + gamma.
+  for (int i = 0; i < 256; i++) {
+    float r = palette[i * 3 + 0];
+    float g = palette[i * 3 + 1];
+    float b = palette[i * 3 + 2];
+    float y = (0.299f * r + 0.587f * g + 0.114f * b) / 255.0f;
+    float v = powf(y, gamma_val) * 255.0f + 0.5f;
+    gray_lut[i] = (byte)(v > 255.0f ? 255.0f : v);
+  }
 }
 int I_GetPaletteIndex(int r, int g, int b) {
 #ifdef DEBUG

@@ -212,9 +212,17 @@ void CalcKeyPos(void) {
     SetRect(&fireKey,  5, 1, 2, 2, u, pad, y0);
 }
 
+// Desenha (ou redesenha) toda a area do gamepad: fundo branco que cobre qualquer coisa
+// que a interface do Kindle tenha deixado ali, e cada botao como uma caixa com borda
+// preta, com o rotulo centralizado.
 void PlaceKeys(void) {
-    printf("PlaceKeys\n");
-
+    FBInkRect pad_area = {
+        .left = 0,
+        .top = video_out_h,
+        .width = scw,
+        .height = sch - video_out_h,
+    };
+    fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &pad_area, false, 0xFF);
 
     FBInkOTConfig fbink_ot_cfg = {
         .size_px = BTN_SIZE / 4,
@@ -233,21 +241,22 @@ void PlaceKeys(void) {
         if (!keys[i]) {
             break; // It's joever
         }
-        printf("Placing key %d\n", i);
+
+        // borda preta + miolo branco
+        FBInkRect outer = keys[i]->rect;
+        fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &outer, false, 0x00);
+        FBInkRect inner = {
+            .left = outer.left + 5,
+            .top = outer.top + 5,
+            .width = outer.width - 10,
+            .height = outer.height - 10,
+        };
+        fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &inner, false, 0xFF);
+
         fbink_ot_cfg.size_px = MIN(MIN(keys[i]->rect.width, keys[i]->rect.height) / 4, 56);
         fbink_ot_cfg.margins.top = keys[i]->rect.top + (keys[i]->rect.height / 2) - (fbink_ot_cfg.size_px / 2);
         fbink_ot_cfg.margins.left = keys[i]->rect.left;
         fbink_ot_cfg.margins.right = scw - (keys[i]->rect.left + keys[i]->rect.width);
-        printf("%d %d %d\n", fbink_ot_cfg.margins.top, fbink_ot_cfg.margins.left, fbink_ot_cfg.margins.right);
-        // fbink_fill_rect_gray(fbink_fd, &fbink_cfg, &keys[i]->rect, 0U, 0x00);
-#if DEBUG
-        printf("fbink_invert_rect\n");
-#endif
-        fbink_invert_rect(fbink_fd, &keys[i]->rect, 0U);
-
-#if DEBUG
-        printf("fbink_print_ot: %s\n", keys[i]->label);
-#endif
         fbink_print_ot(fbink_fd, keys[i]->label, &fbink_ot_cfg, &fbink_cfg, 0U);
     }
 
